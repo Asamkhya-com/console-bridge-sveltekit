@@ -410,6 +410,7 @@ export function initConsolebridge(userOptions: ConsoleBridgeOptions = {}) {
  * Restore original console methods
  */
 export function restoreConsole() {
+	if (!browser) return;
 	console.log = originalConsole.log;
 	console.warn = originalConsole.warn;
 	console.error = originalConsole.error;
