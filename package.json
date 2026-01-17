@@ -1,0 +1,47 @@
+{
+	"name": "console-bridge-sveltekit",
+	"version": "1.0.0",
+	"description": "Forward frontend console logs to backend for easier debugging in SvelteKit",
+	"type": "module",
+	"exports": {
+		".": {
+			"types": "./dist/index.d.ts",
+			"import": "./dist/index.js"
+		},
+		"./client": {
+			"types": "./dist/lib/client.d.ts",
+			"import": "./dist/lib/client.js"
+		},
+		"./server": {
+			"types": "./dist/lib/server.d.ts",
+			"import": "./dist/lib/server.js"
+		}
+	},
+	"files": [
+		"dist",
+		"README.md",
+		"LICENSE"
+	],
+	"scripts": {
+		"build": "tsc",
+		"prepublishOnly": "pnpm build"
+	},
+	"keywords": [
+		"sveltekit",
+		"console",
+		"logging",
+		"debugging",
+		"development"
+	],
+	"author": "Chintan Thakkar",
+	"license": "MIT",
+	"peerDependencies": {
+		"@sveltejs/kit": "^2.0.0",
+		"svelte": "^5.0.0"
+	},
+	"devDependencies": {
+		"@sveltejs/kit": "^2.0.0",
+		"svelte": "^5.0.0",
+		"typescript": "^5.0.0"
+	}
+}
