@@ -5,13 +5,58 @@
 import type { RequestHandler } from '@sveltejs/kit';
 import { json, error } from '@sveltejs/kit';
 
+export interface NetworkLogData {
+	method?: string;
+	url: string;
+	status?: number;
+	duration?: number;
+	responseBody?: string;
+	requestType?: 'fetch' | 'xhr';
+	level: string;
+}
+
 export interface ConsoleBridgeServerOptions {
 	prefix?: string;
 	formatter?: (level: string, url: string, timestamp: string, args: any[]) => string;
 	onLog?: (level: string, url: string, timestamp: string, args: any[]) => void;
+	networkFormatter?: (data: NetworkLogData) => string;
 }
 
-const DEFAULT_OPTIONS: Required<ConsoleBridgeServerOptions> = {
+function sanitizeForLog(str: string): string {
+	// Strip ANSI escapes, control chars, and newlines to prevent log line forgery
+	return str
+		.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '')
+		.replace(/[\x00-\x1f\x7f]/g, ' ')
+		.trim();
+}
+
+function defaultNetworkFormatter(data: NetworkLogData): string {
+	const { method = 'GET', url, status, duration, responseBody } = data;
+
+	let shortUrl = url;
+	try {
+		const parsed = new URL(url);
+		shortUrl = parsed.pathname + parsed.search;
+	} catch {
+		// keep as-is
+	}
+
+	const statusStr = status === 0 ? 'NETWORK_ERROR' : String(status);
+	const durationStr = duration !== undefined ? ` (${duration}ms)` : '';
+	let line = `${method} ${shortUrl} \u2192 ${statusStr}${durationStr}`;
+
+	if (status !== undefined && (status === 0 || status >= 400) && responseBody) {
+		const sanitized = sanitizeForLog(responseBody);
+		const truncated = sanitized.length > 200 ? sanitized.slice(0, 200) + '...' : sanitized;
+		line += ` Body: ${truncated}`;
+	}
+
+	return line;
+}
+
+const DEFAULT_OPTIONS: Required<
+	Pick<ConsoleBridgeServerOptions, 'prefix' | 'formatter' | 'onLog'>
+> = {
 	prefix: '[FRONTEND',
 	formatter: (level, url, timestamp) =>
 		`[FRONTEND ${level.toUpperCase()}] ${url} @ ${timestamp}`,
@@ -26,6 +71,7 @@ export function createConsoleBridgeEndpoint(
 	userOptions: ConsoleBridgeServerOptions = {}
 ): RequestHandler {
 	const options = { ...DEFAULT_OPTIONS, ...userOptions };
+	const networkFmt = userOptions.networkFormatter ?? defaultNetworkFormatter;
 
 	return async ({ request }) => {
 		// Only allow in dev mode
@@ -40,15 +86,59 @@ export function createConsoleBridgeEndpoint(
 			const logs = Array.isArray(body.batch) ? body.batch : [body];
 
 			for (const log of logs) {
-				const { level, args, timestamp, url, stack } = log;
+				const {
+					kind,
+					level,
+					args,
+					timestamp,
+					url,
+					stack,
+					method,
+					status,
+					duration,
+					responseBody,
+					requestType
+				} = log;
 
-				// Custom formatter or default
+				// Network entries: use structured formatting
+				if (kind === 'network') {
+					const formatted = networkFmt({
+						method,
+						url,
+						status,
+						duration,
+						responseBody,
+						requestType,
+						level
+					});
+
+					const netPrefix =
+						level === 'error' || level === 'warn'
+							? '[FRONTEND NET ERROR]'
+							: '[FRONTEND NET]';
+
+					const fullLine = `${netPrefix} ${formatted}`;
+
+					if (level === 'error') {
+						console.error(fullLine);
+					} else if (level === 'warn') {
+						console.warn(fullLine);
+					} else {
+						console.info(fullLine);
+					}
+
+					if (stack) {
+						console.error(`  Stack: ${stack}`);
+					}
+
+					options.onLog(level, url, timestamp, args);
+					continue;
+				}
+
+				// Console/error entries: existing formatting
 				const prefix = options.formatter(level, url, timestamp, args);
-
-				// Prepare args for logging (include stack if present)
 				const logArgs = stack ? [...args, `\nStack: ${stack}`] : args;
 
-				// Log to console
 				switch (level) {
 					case 'error':
 						console.error(prefix, ...logArgs);
@@ -62,14 +152,10 @@ export function createConsoleBridgeEndpoint(
 					case 'debug':
 						console.debug(prefix, ...logArgs);
 						break;
-					case 'network':
-						console.info(prefix, ...logArgs);
-						break;
 					default:
 						console.log(prefix, ...logArgs);
 				}
 
-				// Custom callback
 				options.onLog(level, url, timestamp, args);
 			}
 

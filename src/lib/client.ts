@@ -15,6 +15,9 @@ export interface ConsoleBridgeOptions {
 	networkBodyLimit?: number;
 	networkIgnore?: (string | RegExp)[];
 	networkInclude?: (string | RegExp)[];
+	loopThreshold?: number;
+	loopWindow?: number;
+	maxQueueSize?: number;
 }
 
 type LogLevel = 'log' | 'warn' | 'error' | 'info' | 'debug';
@@ -46,7 +49,10 @@ const DEFAULT_OPTIONS: Required<ConsoleBridgeOptions> = {
 	captureErrors: true,
 	networkBodyLimit: 500,
 	networkIgnore: [],
-	networkInclude: []
+	networkInclude: [],
+	loopThreshold: 10,
+	loopWindow: 5000,
+	maxQueueSize: 200
 };
 
 let isSending = false;
@@ -65,6 +71,11 @@ let errorHandler: ((event: ErrorEvent) => void) | null = null;
 let rejectionHandler: ((event: PromiseRejectionEvent) => void) | null = null;
 
 const xhrMeta = new WeakMap<XMLHttpRequest, { method: string; url: string; start: number }>();
+
+// Loop detection state
+const recentMessages: Map<string, number[]> = new Map();
+const suppressedKeys: Set<string> = new Set();
+let sessionId = 0;
 
 // Store original console methods
 const originalConsole = {
@@ -105,9 +116,129 @@ function isNetworkTracked(targetUrl: string) {
 	return true;
 }
 
+function getNetworkLevel(status: number): EventLevel {
+	if (status === 0 || status >= 500) return 'error';
+	if (status >= 400) return 'warn';
+	return 'network';
+}
+
+function getLoopKey(entry: LogEntry): string {
+	if (entry.kind === 'network') {
+		// Include level so errors aren't suppressed by prior successful polling
+		return `${entry.method ?? ''} ${entry.url} ${entry.level}`;
+	}
+	try {
+		const first = entry.args?.[0];
+		if (first === undefined || first === null) return '';
+		const str = typeof first === 'string' ? first : JSON.stringify(first);
+		return str.slice(0, 200);
+	} catch {
+		return '';
+	}
+}
+
+function scheduleUnsuppress(key: string) {
+	if (!options) return;
+	const loopWindow = options.loopWindow;
+	const threshold = options.loopThreshold;
+	const currentSession = sessionId;
+
+	setTimeout(() => {
+		// Bail if session changed (restoreConsole + reinit)
+		if (currentSession !== sessionId) return;
+
+		const ts = recentMessages.get(key);
+		const now = Date.now();
+		const recent = ts?.filter((t) => t > now - loopWindow) ?? [];
+		recentMessages.set(key, recent);
+		if (recent.length < threshold) {
+			suppressedKeys.delete(key);
+			recentMessages.delete(key);
+		} else {
+			scheduleUnsuppress(key);
+		}
+	}, loopWindow);
+}
+
+/**
+ * Returns true if this entry should be suppressed (loop detected).
+ * Emits a single warning when a loop is first detected.
+ */
+function checkMessageLoop(entry: LogEntry): boolean {
+	if (!options) return false;
+
+	const key = getLoopKey(entry);
+	if (!key) return false;
+
+	const now = Date.now();
+	const loopWindow = options.loopWindow;
+	const threshold = options.loopThreshold;
+
+	let timestamps = recentMessages.get(key);
+	if (!timestamps) {
+		// Evict oldest keys if map grows too large (100 max tracked keys)
+		if (recentMessages.size >= 100) {
+			const firstKey = recentMessages.keys().next().value;
+			if (firstKey !== undefined) {
+				recentMessages.delete(firstKey);
+				suppressedKeys.delete(firstKey);
+			}
+		}
+		timestamps = [];
+		recentMessages.set(key, timestamps);
+	}
+
+	// Prune timestamps outside window
+	const cutoff = now - loopWindow;
+	while (timestamps.length > 0 && timestamps[0] < cutoff) {
+		timestamps.shift();
+	}
+
+	timestamps.push(now);
+
+	// Cap array to prevent unbounded growth during sustained loops
+	if (timestamps.length > threshold * 2) {
+		timestamps.splice(0, timestamps.length - threshold);
+	}
+
+	if (timestamps.length >= threshold) {
+		if (!suppressedKeys.has(key)) {
+			suppressedKeys.add(key);
+
+			// Emit a single summary warning (use 'console' kind so server formats it as text)
+			queueEntry({
+				kind: 'console',
+				level: 'warn',
+				args: [
+					`LOOP DETECTED: "${key.slice(0, 80)}" repeated ${timestamps.length} times in ${loopWindow / 1000}s — suppressing`
+				],
+				timestamp: new Date().toISOString(),
+				url: entry.url ?? window.location.href,
+				pageUrl: window.location.href
+			});
+
+			scheduleUnsuppress(key);
+		}
+		return true;
+	}
+
+	// Un-suppress if activity dropped below threshold
+	if (suppressedKeys.has(key)) {
+		suppressedKeys.delete(key);
+	}
+
+	return false;
+}
+
 function queueEntry(entry: LogEntry) {
 	if (!dev || !browser || !options) return;
-	if (isSending) return;
+
+	// Enforce max queue size — drop oldest 10% when full
+	if (logQueue.length >= options.maxQueueSize) {
+		const dropCount = Math.max(1, Math.floor(options.maxQueueSize * 0.1));
+		logQueue.splice(0, dropCount);
+	}
+
 	logQueue.push(entry);
 	scheduleBatch();
 }
@@ -160,12 +291,13 @@ function createInterceptor(level: LogLevel) {
 			if (level === 'error' && args[0] instanceof Error) {
 				const error = args[0];
 				if (error.stack) {
-					// Truncate to prevent huge payloads
 					entry.stack = error.stack.slice(0, 1000);
 				}
 			}
 
-			queueEntry(entry);
+			if (!checkMessageLoop(entry)) {
+				queueEntry(entry);
+			}
 		}
 	};
 }
@@ -225,9 +357,9 @@ function patchFetch() {
 			const duration = Math.round(performance.now() - start);
 			const responseBody = await readResponseBody(response);
 
-			queueEntry({
+			const entry: LogEntry = {
 				kind: 'network',
-				level: 'network',
+				level: getNetworkLevel(response.status),
 				args: [`${method} ${resolvedUrl}`, `status: ${response.status}`, `duration: ${duration}ms`],
 				timestamp: new Date().toISOString(),
 				url: resolvedUrl,
@@ -237,7 +369,11 @@ function patchFetch() {
 				requestType: 'fetch',
 				pageUrl: window.location.href,
 				responseBody
-			});
+			};
+
+			if (!checkMessageLoop(entry)) {
+				queueEntry(entry);
+			}
 
 			return response;
 		} catch (err) {
@@ -245,9 +381,9 @@ function patchFetch() {
 			const message = err instanceof Error ? err.message : String(err);
 			const stack = err instanceof Error && err.stack ? err.stack.slice(0, 1000) : undefined;
 
-			queueEntry({
+			const entry: LogEntry = {
 				kind: 'network',
-				level: 'network',
+				level: 'error',
 				args: [`${method} ${resolvedUrl}`, `error: ${message}`, `duration: ${duration}ms`],
 				timestamp: new Date().toISOString(),
 				url: resolvedUrl,
@@ -257,7 +393,11 @@ function patchFetch() {
 				requestType: 'fetch',
 				pageUrl: window.location.href,
 				stack
-			});
+			};
+
+			if (!checkMessageLoop(entry)) {
+				queueEntry(entry);
+			}
 
 			throw err;
 		}
@@ -280,17 +420,17 @@ function patchXhr() {
 
 		const resolvedUrl = meta ? resolveUrl(meta.url) : '';
 
-		const onDone = async () => {
+		const onDone = () => {
 			this.removeEventListener('loadend', onDone);
 			if (!meta || !resolvedUrl || !isNetworkTracked(resolvedUrl)) return;
 
 			const duration = Math.round(performance.now() - meta.start);
 			const status = this.status || 0;
-			const responseBody = await readXhrBody(this);
+			const responseBody = readXhrBody(this);
 
-			queueEntry({
+			const entry: LogEntry = {
 				kind: 'network',
-				level: 'network',
+				level: getNetworkLevel(status),
 				args: [`${meta.method} ${resolvedUrl}`, `status: ${status}`, `duration: ${duration}ms`],
 				timestamp: new Date().toISOString(),
 				url: resolvedUrl,
@@ -300,7 +440,11 @@ function patchXhr() {
 				requestType: 'xhr',
 				pageUrl: window.location.href,
 				responseBody
-			});
+			};
+
+			if (!checkMessageLoop(entry)) {
+				queueEntry(entry);
+			}
 		};
 
 		this.addEventListener('loadend', onDone);
@@ -331,7 +475,7 @@ function attachErrorListeners() {
 	errorHandler = (event) => {
 		const stack = event.error?.stack ? event.error.stack.slice(0, 1000) : undefined;
 
-		queueEntry({
+		const entry: LogEntry = {
 			kind: 'error',
 			level: 'error',
 			args: [event.message],
@@ -339,7 +483,11 @@ function attachErrorListeners() {
 			url: event.filename ?? window.location.href,
 			stack,
 			pageUrl: window.location.href
-		});
+		};
+
+		if (!checkMessageLoop(entry)) {
+			queueEntry(entry);
+		}
 	};
 
 	rejectionHandler = (event) => {
@@ -347,7 +495,7 @@ function attachErrorListeners() {
 		const message = reason instanceof Error ? reason.message : String(reason);
 		const stack = reason instanceof Error && reason.stack ? reason.stack.slice(0, 1000) : undefined;
 
-		queueEntry({
+		const entry: LogEntry = {
 			kind: 'error',
 			level: 'error',
 			args: [message],
@@ -355,7 +503,11 @@ function attachErrorListeners() {
 			url: window.location.href,
 			stack,
 			pageUrl: window.location.href
-		});
+		};
+
+		if (!checkMessageLoop(entry)) {
+			queueEntry(entry);
+		}
 	};
 
 	window.addEventListener('error', errorHandler);
@@ -379,7 +531,17 @@ function detachErrorListeners() {
 export function initConsolebridge(userOptions: ConsoleBridgeOptions = {}) {
 	if (!browser || !dev) return;
 
-	options = { ...DEFAULT_OPTIONS, ...userOptions };
+	sessionId++;
+	const merged = { ...DEFAULT_OPTIONS, ...userOptions };
+
+	// Clamp to safe ranges to prevent DoS from zero/negative/NaN/Infinity values
+	const safeInt = (v: number, min: number, max: number, fallback: number) =>
+		Number.isFinite(v) ? Math.min(max, Math.max(min, Math.floor(v))) : fallback;
+	merged.loopThreshold = safeInt(merged.loopThreshold, 2, 1000, DEFAULT_OPTIONS.loopThreshold);
+	merged.loopWindow = safeInt(merged.loopWindow, 100, 60000, DEFAULT_OPTIONS.loopWindow);
+	merged.maxQueueSize = safeInt(merged.maxQueueSize, 10, 10000, DEFAULT_OPTIONS.maxQueueSize);
+
+	options = merged;
 
 	// Intercept only specified levels
 	if (options.levels.includes('log')) console.log = createInterceptor('log');
@@ -411,6 +573,7 @@ export function initConsolebridge(userOptions: ConsoleBridgeOptions = {}) {
  */
 export function restoreConsole() {
 	if (!browser) return;
+	sessionId++;
 	console.log = originalConsole.log;
 	console.warn = originalConsole.warn;
 	console.error = originalConsole.error;
@@ -418,6 +581,14 @@ export function restoreConsole() {
 	console.debug = originalConsole.debug;
 	restoreNetwork();
 	detachErrorListeners();
+	recentMessages.clear();
+	suppressedKeys.clear();
+	logQueue.length = 0;
+	isSending = false;
+	if (batchTimer) {
+		clearTimeout(batchTimer);
+		batchTimer = null;
+	}
 	options = null;
 	isInitialized = false;
 }
