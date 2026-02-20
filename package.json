@@ -1,6 +1,6 @@
 {
 	"name": "console-bridge-sveltekit",
-	"version": "1.0.2",
+	"version": "1.1.0",
 	"description": "Forward frontend console logs to backend for easier debugging in SvelteKit",
 	"type": "module",
 	"exports": {
